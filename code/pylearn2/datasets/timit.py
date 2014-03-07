@@ -35,8 +35,9 @@ class TIMIT(Dataset):
     _std = 542.48824133746177
 
     def __init__(self, which_set, frame_length, overlap=0,
-                 frames_per_example=1, start=0, stop=None, audio_only=False,
-                 rng=_default_seed):
+                 frames_per_example=1, start=0, stop=None,
+                 audio_only=False, n_prev_phones=0, n_next_phones=0,
+                 samples_to_predict=1, rng=_default_seed):
         """
         Parameters
         ----------
@@ -66,7 +67,9 @@ class TIMIT(Dataset):
         self.frames_per_example = frames_per_example
         self.offset = self.frame_length - self.overlap
         self.audio_only = audio_only
-
+        self.n_prev_phones = n_prev_phones
+        self.n_next_phones = n_next_phones
+        self.samples_to_predict = samples_to_predict
         # RNG initialization
         if hasattr(rng, 'random_integers'):
             self.rng = rng
@@ -102,11 +105,14 @@ class TIMIT(Dataset):
                 phones_segmented_sequence = segment_axis(phones_sequence,
                                                          frame_length,
                                                          overlap)
-                self.phones[sequence_id] = phones_segmented_sequence
+                
                 # phones_segmented_sequence = scipy.stats.mode(
-                #     phones_segmented_sequence,
-                #     axis=1
-                # )[0].flatten()
+                #     phones_segmented_sequence, axis=0 )[0].flatten()
+                # if self.n_next_phones == 0:
+                #     self.phones[sequence_id] = numpy.asarray(scipy.stats.mode(phones_segmented_sequence[self.n_prev_phones:], axis=1)[0].flatten(), dtype=numpy.int32)
+                # else:
+                #     self.phones[sequence_id] = numpy.asarray(scipy.stats.mode(phones_segmented_sequence[self.n_prev_phones:-self.n_next_phones], axis=1)[0], dtype=numpy.int32)
+                self.phones[sequence_id] = numpy.asarray(numpy.concatenate([scipy.stats.mode(phones_segmented_sequence[k-self.n_prev_phones:k+self.n_next_phones+1], axis=1)[0].T for k in range(self.n_prev_phones,len(phones_segmented_sequence)-self.n_next_phones)]), dtype=numpy.int16)
                 # phones_segmented_sequence = numpy.asarray(
                 #     phones_segmented_sequence,
                 #     dtype='int'
@@ -117,7 +123,10 @@ class TIMIT(Dataset):
                 phonemes_segmented_sequence = segment_axis(phonemes_sequence,
                                                            frame_length,
                                                            overlap)
-                self.phonemes[sequence_id] = phonemes_segmented_sequence
+                if self.n_next_phones == 0:
+                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:]
+                else:
+                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
                 # phonemes_segmented_sequence = scipy.stats.mode(
                 #     phonemes_segmented_sequence,
                 #     axis=1
@@ -132,7 +141,10 @@ class TIMIT(Dataset):
                 words_segmented_sequence = segment_axis(words_sequence,
                                                         frame_length,
                                                         overlap)
-                self.words[sequence_id] = words_segmented_sequence
+                if self.n_next_phones == 0:
+                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:]
+                else:
+                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
                 # words_segmented_sequence = scipy.stats.mode(
                 #     words_segmented_sequence,
                 #     axis=1
@@ -146,11 +158,14 @@ class TIMIT(Dataset):
             samples_segmented_sequence = segment_axis(samples_sequence,
                                                       frame_length,
                                                       overlap)
-            self.raw_wav[sequence_id] = samples_segmented_sequence
+            if self.n_next_phones == 0:
+                self.raw_wav[sequence_id] = samples_segmented_sequence[self.n_prev_phones:]
+            else:
+                self.raw_wav[sequence_id] = samples_segmented_sequence[self.n_prev_phones:-self.n_next_phones-1]
 
             # TODO: change me
             # Generate features/targets/phones/phonemes/words map
-            num_frames = samples_segmented_sequence.shape[0]
+            num_frames = samples_segmented_sequence.shape[0]-(self.n_prev_phones+self.n_next_phones)
             num_examples = num_frames - self.frames_per_example
             examples_per_sequence.append(num_examples)
 
@@ -170,17 +185,15 @@ class TIMIT(Dataset):
         def features_map_fn(indexes):
             rval = []
             for sequence_index, example_index in self._fetch_index(indexes):
-                rval.append(self.samples_sequences[sequence_index][example_index:example_index
-                    + self.frames_per_example].ravel())
+                rval.append(self.samples_sequences[sequence_index][example_index:example_index + self.frames_per_example].ravel())
             return rval
 
-        targets_space = VectorSpace(dim=self.frame_length)
+        targets_space = VectorSpace(dim=self.samples_to_predict)
         targets_source = 'targets'
         def targets_map_fn(indexes):
             rval = []
             for sequence_index, example_index in self._fetch_index(indexes):
-                rval.append(self.samples_sequences[sequence_index][example_index
-                    + self.frames_per_example].ravel())
+                rval.append(self.samples_sequences[sequence_index][example_index + self.frames_per_example - 1][0:self.samples_to_predict])
             return rval
 
         space_components = [features_space, targets_space]
@@ -191,14 +204,13 @@ class TIMIT(Dataset):
         if not self.audio_only:
             num_phones = numpy.max([numpy.max(sequence) for sequence
                                     in self.phones]) + 1
-            phones_space = IndexSpace(max_labels=num_phones, dim=1,
+            phones_space = IndexSpace(max_labels=num_phones, dim=1+self.n_prev_phones+self.n_next_phones,
                                       dtype=str(self.phones_sequences[0].dtype))
             phones_source = 'phones'
             def phones_map_fn(indexes):
                 rval = []
                 for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.phones_sequences[sequence_index][example_index
-                        + self.frames_per_example].ravel())
+                    rval.append(self.phones_sequences[sequence_index][example_index].ravel())
                 return rval
 
             num_phonemes = numpy.max([numpy.max(sequence) for sequence
@@ -409,12 +421,12 @@ class TIMIT(Dataset):
 if __name__ == "__main__":
     # train_timit = TIMIT("train", frame_length=240, overlap=10,
     #                     frames_per_example=5)
-    valid_timit = TIMIT("valid", frame_length=1, overlap=0,
-                        frames_per_example=100, audio_only=False)
+    valid_timit = TIMIT("valid", frame_length=240, overlap=0,
+                        frames_per_example=1, audio_only=False, start=0, stop = 2, n_next_phones=1, n_prev_phones=1)
     # test_timit = TIMIT("test", frame_length=240, overlap=10,
     #                     frames_per_example=5)
     # import pdb; pdb.set_trace()
-    data_specs = (IndexSpace(max_labels=62, dim=1, dtype='int16'),
+    data_specs = (IndexSpace(max_labels=62, dim=3, dtype='int16'),
                   'phones')
     it = valid_timit.iterator(mode='random_uniform', data_specs=data_specs,
                               num_batches=100, batch_size=256)
