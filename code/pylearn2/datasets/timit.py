@@ -37,7 +37,8 @@ class TIMIT(Dataset):
     def __init__(self, which_set, frame_length, overlap=0,
                  frames_per_example=1, start=0, stop=None,
                  audio_only=False, n_prev_phones=0, n_next_phones=0,
-                 samples_to_predict=1, rng=_default_seed):
+                 samples_to_predict=1, filter_fn=None,
+                 rng=_default_seed):
         """
         Parameters
         ----------
@@ -81,6 +82,15 @@ class TIMIT(Dataset):
         # Standardize data
         for i, sequence in enumerate(self.raw_wav):
             self.raw_wav[i] = (sequence - TIMIT._mean) / TIMIT._std
+
+        if filter_fn is not None:
+            filter_fn = eval(filter_fn)
+            indexes = filter_fn(self.speaker_info_list[self.speaker_id])
+            self.raw_wav = self.raw_wav[indexes]
+            if not self.audio_only:
+                self.phones = self.phones[indexes]
+                self.phonemes = self.phonemes[indexes]
+                self.words = self.words[indexes]
 
         # Slice data
         if stop is not None:
@@ -161,7 +171,7 @@ class TIMIT(Dataset):
             if self.n_next_phones == 0:
                 self.raw_wav[sequence_id] = samples_segmented_sequence[self.n_prev_phones:]
             else:
-                self.raw_wav[sequence_id] = samples_segmented_sequence[self.n_prev_phones:-self.n_next_phones-1]
+                self.raw_wav[sequence_id] = samples_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
 
             # TODO: change me
             # Generate features/targets/phones/phonemes/words map
@@ -193,7 +203,7 @@ class TIMIT(Dataset):
         def targets_map_fn(indexes):
             rval = []
             for sequence_index, example_index in self._fetch_index(indexes):
-                rval.append(self.samples_sequences[sequence_index][example_index + self.frames_per_example - 1][0:self.samples_to_predict])
+                rval.append(self.samples_sequences[sequence_index][example_index + self.frames_per_example][0:self.samples_to_predict])
             return rval
 
         space_components = [features_space, targets_space]
@@ -417,17 +427,26 @@ class TIMIT(Dataset):
                                      return_tuple=return_tuple,
                                      convert=convert)
 
+def male_speakers(spkrinfo):
+    return spkrinfo[:,24] == 1
+        
+def female_speakers(spkrinfo):
+    return spkrinfo[:,25] == 1
+
+def dialect_region(spkrinfo, dr):
+    return spkrinfo[:,dr] == 1
 
 if __name__ == "__main__":
     # train_timit = TIMIT("train", frame_length=240, overlap=10,
     #                     frames_per_example=5)
     valid_timit = TIMIT("valid", frame_length=240, overlap=0,
-                        frames_per_example=1, audio_only=False, start=0, stop = 2, n_next_phones=1, n_prev_phones=1)
+                        frames_per_example=1, audio_only=False, start=0, stop = 20, n_next_phones=1, n_prev_phones=1, filter_fn='male_speakers')
     # test_timit = TIMIT("test", frame_length=240, overlap=10,
     #                     frames_per_example=5)
     # import pdb; pdb.set_trace()
     data_specs = (IndexSpace(max_labels=62, dim=3, dtype='int16'),
                   'phones')
-    it = valid_timit.iterator(mode='random_uniform', data_specs=data_specs,
-                              num_batches=100, batch_size=256)
+    it = valid_timit.iterator(mode='random_uniform',
+                              data_specs=data_specs, num_batches=10,
+                              batch_size=20)
     it.next()
