@@ -11,6 +11,7 @@ __email__ = "dumouliv@iro"
 import os.path
 import functools
 import numpy
+import scipy.sparse
 from pylearn2.utils.iteration import resolve_iterator_class
 from pylearn2.datasets.dataset import Dataset
 from pylearn2.space import CompositeSpace, VectorSpace, IndexSpace
@@ -18,11 +19,11 @@ from pylearn2.utils import serial
 from pylearn2.utils import safe_zip
 from research.code.scripts.segmentaxis import segment_axis
 from research.code.pylearn2.utils.iteration import FiniteDatasetIterator
+from sparse_coding.sparse_coding_gammatone import gammatone_matrix, erb_space
 import scipy.stats
-from brian import hertz, khertz
-from brian.hears import Sound, erbspace, Gammatone
 
-class TIMITGTFB(Dataset):
+
+class TIMITSparse(Dataset):
     """
     Frame-based TIMIT dataset
     """
@@ -30,14 +31,14 @@ class TIMITGTFB(Dataset):
     
     # Mean and standard deviation of the acoustic samples from the whole
     # dataset (train, valid, test).
-    #_mean = 0.0035805809921434142
-    #_std = 542.48824133746177
+    _mean = 0.0035805809921434142
+    _std = 542.48824133746177
 
     def __init__(self, which_set, frame_length, overlap=0,
-                 n_channels=64, frames_per_example=1, start=0,
-                 stop=None, audio_only=False, n_prev_phones=0,
-                 n_next_phones=0, samples_to_predict=1,
-                 filter_fn=None, rng=_default_seed):
+                 frames_per_example=1, start=0, stop=None,
+                 audio_only=False, n_prev_phones=0, n_next_phones=0,
+                 samples_to_predict=1, filter_fn=None,
+                 rng=_default_seed, b=1.019, step=8, n_channels=50):
         """
         Parameters
         ----------
@@ -70,20 +71,30 @@ class TIMITGTFB(Dataset):
         self.n_prev_phones = n_prev_phones
         self.n_next_phones = n_next_phones
         self.samples_to_predict = samples_to_predict
+        self.b = b
+        self.step = step
         self.n_channels = n_channels
+
+        # Initializing the dictionary
+        self.D = numpy.r_[tuple(gammatone_matrix(self.b, fc,
+                                                 self.frame_length,
+                                                 self.step) for fc in
+                                erb_space(150, 8000,
+                                          self.n_channels))]
+
+        #self.coder = SparseCoder(dictionary=self.D, transform_n_nonzero_coefs=None, transform_alpha=1, transform_algorithm='omp')
+        
         # RNG initialization
         if hasattr(rng, 'random_integers'):
             self.rng = rng
         else:
             self.rng = numpy.random.RandomState(rng)
 
-        self.fc = erbspace(80*hertz, 5*khertz, self.n_channels)
-
         # Load data from disk
         self._load_data(which_set)
         # Standardize data
-        # for i, sequence in enumerate(self.raw_wav):
-        #     self.raw_wav[i] = (sequence - TIMIT._mean) / TIMIT._std
+        for i, sequence in enumerate(self.raw_wav):
+            self.raw_wav[i] = self.scaler.transform(sequence)
 
         if filter_fn is not None:
             filter_fn = eval(filter_fn)
@@ -138,34 +149,20 @@ class TIMITGTFB(Dataset):
                 else:
                     self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
 
-            # TODO: look at this, does it force copying the data?
-            # Sequence segmentation
-            # s = Sound(samples_sequence, samplerate=16*khertz)
-            # fb = Gammatone(s, self.fc)
-            # y = fb.process()
-            # channel_energy = []
-            # Compute energy per channel
-            # for ch in range(self.n_channels):
-            #     y_ch = segment_axis(y[:,ch], frame_length, overlap)
-            #     y_energy = numpy.sum(y_ch**2, axis=1)
-            #     channel_energy.append(y_energy)
-            
-            # channel_energy = numpy.vstack(channel_energy).T
-            # channel_energy = samples_sequence
-            # if self.n_next_phones == 0:
-            #     self.raw_wav[sequence_id] = channel_energy[self.n_prev_phones:]
-            # else:
-            #     self.raw_wav[sequence_id] = channel_energy[self.n_prev_phones:-self.n_next_phones]
+            if self.n_next_phones == 0:
+                self.raw_wav[sequence_id] = self.raw_wav[sequence_id][self.n_prev_phones:]
+            else:
+                self.raw_wav[sequence_id] = self.raw_wav[sequence_id][self.n_prev_phones:-self.n_next_phones]
 
             # TODO: change me
             # Generate features/targets/phones/phonemes/words map
-            num_frames = samples_sequence.shape[0]-(self.n_prev_phones+self.n_next_phones)
+            num_frames = self.raw_wav[sequence_id].shape[0]
             num_examples = num_frames - self.frames_per_example
             examples_per_sequence.append(num_examples)
 
         self.cumulative_example_indexes = numpy.cumsum(examples_per_sequence)
         self.samples_sequences = self.raw_wav
-#        numpy.save('%s_gtfb_%sch.npy'%(which_set, str(self.n_channels)), self.samples_sequences)
+        #numpy.save('/home/jfsantos/data/%s_sparse_frames.npy' % which_set, self.samples_sequences)
         if not self.audio_only:
             self.phones_sequences = self.phones
             self.phonemes_sequences = self.phonemes
@@ -174,21 +171,21 @@ class TIMITGTFB(Dataset):
 
         # DataSpecs
         features_space = VectorSpace(
-            dim=self.n_channels * self.frames_per_example
+            dim=self.D.shape[0] * self.frames_per_example
         )
         features_source = 'features'
         def features_map_fn(indexes):
             rval = []
             for sequence_index, example_index in self._fetch_index(indexes):
-                rval.append(self.samples_sequences[sequence_index][example_index:example_index + self.frames_per_example].ravel())
+                rval.append(self.samples_sequences[sequence_index][example_index:example_index + self.frames_per_example].todense())
             return rval
 
-        targets_space = VectorSpace(dim=self.n_channels)
+        targets_space = VectorSpace(dim=self.D.shape[0])
         targets_source = 'targets'
         def targets_map_fn(indexes):
             rval = []
             for sequence_index, example_index in self._fetch_index(indexes):
-                rval.append(self.samples_sequences[sequence_index][example_index + self.frames_per_example])
+                rval.append(self.samples_sequences[sequence_index][example_index + self.frames_per_example].todense())
             return rval
 
         space_components = [features_space, targets_space]
@@ -282,7 +279,7 @@ class TIMITGTFB(Dataset):
                                                   "spkr_feature_names.pkl")
         speaker_id_list_path = os.path.join(timit_base_path,
                                             "speakers_ids.pkl")
-        raw_wav_path = os.path.join(timit_base_path, which_set + "_gtfb_64ch.npy")
+        raw_wav_path = os.path.join(timit_base_path, which_set + "_sparse_frames.npy")
         phonemes_path = os.path.join(timit_base_path,
                                      which_set + "_x_phonemes.npy")
         phones_path = os.path.join(timit_base_path,
@@ -290,6 +287,7 @@ class TIMITGTFB(Dataset):
         words_path = os.path.join(timit_base_path, which_set + "_x_words.npy")
         speaker_path = os.path.join(timit_base_path,
                                     which_set + "_spkr.npy")
+        scaler_path = os.path.join(timit_base_path, 'scaler.pkl')
 
         # Load data. For now most of it is not used, as only the acoustic
         # samples are provided, but this is bound to change eventually.
@@ -304,6 +302,7 @@ class TIMITGTFB(Dataset):
             self.phonemes_list = serial.load(phonemes_list_path)
         # Set-related data
         self.raw_wav = serial.load(raw_wav_path)
+        self.scaler = serial.load(scaler_path)
         if not self.audio_only:
             self.phonemes = serial.load(phonemes_path)
             self.phones = serial.load(phones_path)
@@ -422,7 +421,6 @@ def dialect_region(spkrinfo, dr):
     return spkrinfo[:,dr] == 1
 
 if __name__ == "__main__":
-    from sys import argv
-
-    valid_timit = TIMITGTFB(argv[1], frame_length=240, overlap=120,
-                        frames_per_example=1, audio_only=True)
+    valid_timit = TIMITSparse('valid', 160, audio_only=True)
+    #test_timit = TIMITSparse('test', 160, audio_only=True)
+    #train_timit = TIMITSparse('train', 160, audio_only=True)
