@@ -19,6 +19,7 @@ from pylearn2.utils import safe_zip
 from research.code.scripts.segmentaxis import segment_axis
 from research.code.pylearn2.utils.iteration import FiniteDatasetIterator
 import scipy.stats
+import itertools
 from brian import hertz, khertz
 from brian.hears import Sound, erbspace, Gammatone
 
@@ -37,7 +38,7 @@ class TIMITGTFB(Dataset):
                  n_channels=64, frames_per_example=1, start=0,
                  stop=None, audio_only=False, n_prev_phones=0,
                  n_next_phones=0, samples_to_predict=1,
-                 filter_fn=None, rng=_default_seed):
+                 filter_fn=None, rng=_default_seed, gtfb_data_path='/home/jfsantos/data/pylearn2data/timit/readable'):
         """
         Parameters
         ----------
@@ -80,7 +81,7 @@ class TIMITGTFB(Dataset):
         self.fc = erbspace(80*hertz, 5*khertz, self.n_channels)
 
         # Load data from disk
-        self._load_data(which_set)
+        self._load_data(which_set, gtfb_data_path)
         # Standardize data
         # for i, sequence in enumerate(self.raw_wav):
         #     self.raw_wav[i] = (sequence - TIMIT._mean) / TIMIT._std
@@ -91,52 +92,42 @@ class TIMITGTFB(Dataset):
             self.raw_wav = self.raw_wav[indexes]
             if not self.audio_only:
                 self.phones = self.phones[indexes]
-                self.phonemes = self.phonemes[indexes]
-                self.words = self.words[indexes]
 
         # Slice data
         if stop is not None:
             self.raw_wav = self.raw_wav[start:stop]
             if not self.audio_only:
                 self.phones = self.phones[start:stop]
-                self.phonemes = self.phonemes[start:stop]
-                self.words = self.words[start:stop]
         else:
             self.raw_wav = self.raw_wav[start:]
             if not self.audio_only:
                 self.phones = self.phones[start:]
-                self.phonemes = self.phonemes[start:]
-                self.words = self.words[start:]
 
         examples_per_sequence = [0]
 
         for sequence_id, samples_sequence in enumerate(self.raw_wav):
             if not self.audio_only:
+                tot_n_frames = samples_sequence.shape[0]
                 # Phones segmentation
                 phones_sequence = self.phones[sequence_id]
-                phones_segmented_sequence = segment_axis(phones_sequence,frame_length,overlap)
-                phones_mode = numpy.concatenate([scipy.stats.mode(phones_segmented_sequence[k-self.n_prev_phones:k+self.n_next_phones+1],axis=1)[0].T for k in range(self.n_prev_phones,len(phones_segmented_sequence)-self.n_next_phones)])
-                self.phones[sequence_id] = numpy.asarray(phones_mode, dtype=numpy.int16)
-                
-                # Phonemes segmentation
-                phonemes_sequence = self.phonemes[sequence_id]
-                phonemes_segmented_sequence = segment_axis(phonemes_sequence,
-                                                           frame_length,
-                                                           overlap)
-                if self.n_next_phones == 0:
-                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:]
-                else:
-                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
-                
-                # Words segmentation
-                words_sequence = self.words[sequence_id]
-                words_segmented_sequence = segment_axis(words_sequence,
-                                                        frame_length,
-                                                        overlap)
-                if self.n_next_phones == 0:
-                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:]
-                else:
-                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
+                phone_list = numpy.asarray([k for k, g in itertools.groupby(phones_sequence)])
+                phone_position = numpy.cumsum([len(list(g)) for k, g in itertools.groupby(phones_sequence)])
+                frame_position = numpy.arange(0, tot_n_frames*self.overlap, self.overlap)
+                seq_phones = numpy.empty((tot_n_frames, 1+self.n_prev_phones+self.n_next_phones), dtype=int)
+                for frame in range(tot_n_frames):
+                    cur_phone_idx = (frame_position[frame] < phone_position).argmax()
+                    if self.n_prev_phones > 0:
+                        if cur_phone_idx - self.n_prev_phones < 0:
+                            seq_phones[frame,0:self.n_prev_phones] = 5 # code for silent frame
+                        else:
+                            seq_phones[frame,0:self.n_prev_phones] = phone_list[cur_phone_idx-self.n_prev_phones:cur_phone_idx] # prev phones
+                    if self.n_next_phones > 0:
+                        if cur_phone_idx + self.n_next_phones >= len(phone_list):
+                            seq_phones[frame,-self.n_next_phones:] = 5 # code for silent frame
+                        else:
+                            seq_phones[frame,-self.n_next_phones] = phone_list[cur_phone_idx+1:cur_phone_idx+self.n_next_phones+1] #next phones
+                    seq_phones[frame,self.n_prev_phones] = phone_list[cur_phone_idx]
+                self.phones[sequence_id] = seq_phones
 
             # TODO: look at this, does it force copying the data?
             # Sequence segmentation
@@ -168,8 +159,6 @@ class TIMITGTFB(Dataset):
 #        numpy.save('%s_gtfb_%sch.npy'%(which_set, str(self.n_channels)), self.samples_sequences)
         if not self.audio_only:
             self.phones_sequences = self.phones
-            self.phonemes_sequences = self.phonemes
-            self.words_sequences = self.words
         self.num_examples = self.cumulative_example_indexes[-1]
 
         # DataSpecs
@@ -208,37 +197,10 @@ class TIMITGTFB(Dataset):
                     rval.append(self.phones_sequences[sequence_index][example_index].ravel())
                 return rval
 
-            num_phonemes = numpy.max([numpy.max(sequence) for sequence
-                                      in self.phonemes]) + 1
-            phonemes_space = IndexSpace(max_labels=num_phonemes, dim=1,
-                                        dtype=str(self.phonemes_sequences[0].dtype))
-            phonemes_source = 'phonemes'
-            def phonemes_map_fn(indexes):
-                rval = []
-                for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.phonemes_sequences[sequence_index][example_index
-                        + self.frames_per_example].ravel())
-                return rval
-
-            num_words = numpy.max([numpy.max(sequence) for sequence
-                                   in self.words]) + 1
-            words_space = IndexSpace(max_labels=num_words, dim=1,
-                                     dtype=str(self.words_sequences[0].dtype))
-            words_source = 'words'
-            def words_map_fn(indexes):
-                rval = []
-                for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.words_sequences[sequence_index][example_index
-                        + self.frames_per_example].ravel())
-                return rval
-
-            space_components.extend([phones_space, phonemes_space,
-                                     words_space])
-            source_components.extend([phones_source, phonemes_source,
-                                     words_source])
-            map_fn_components.extend([phones_map_fn, phonemes_map_fn,
-                                     words_map_fn])
-            batch_components.extend([None, None, None])
+            space_components.extend([phones_space])
+            source_components.extend([phones_source])
+            map_fn_components.extend([phones_map_fn])
+            batch_components.extend([None])
 
         space = CompositeSpace(space_components)
         source = tuple(source_components)
@@ -257,7 +219,7 @@ class TIMITGTFB(Dataset):
         return zip(digit,
                    numpy.array(indexes) - self.cumulative_example_indexes[digit])
 
-    def _load_data(self, which_set):
+    def _load_data(self, which_set, gtfb_data_path):
         """
         Load the TIMIT data from disk.
 
@@ -275,19 +237,13 @@ class TIMITGTFB(Dataset):
         timit_base_path = os.path.join(os.environ["PYLEARN2_DATA_PATH"],
                                        "timit/readable")
         speaker_info_list_path = os.path.join(timit_base_path, "spkrinfo.npy")
-        phonemes_list_path = os.path.join(timit_base_path,
-                                          "reduced_phonemes.pkl")
-        words_list_path = os.path.join(timit_base_path, "words.pkl")
         speaker_features_list_path = os.path.join(timit_base_path,
                                                   "spkr_feature_names.pkl")
         speaker_id_list_path = os.path.join(timit_base_path,
                                             "speakers_ids.pkl")
-        raw_wav_path = os.path.join(timit_base_path, which_set + "_gtfb_64ch.npy")
-        phonemes_path = os.path.join(timit_base_path,
-                                     which_set + "_x_phonemes.npy")
+        raw_wav_path = os.path.join(gtfb_data_path, which_set + "_gtfb_64ch.npy")
         phones_path = os.path.join(timit_base_path,
                                      which_set + "_x_phones.npy")
-        words_path = os.path.join(timit_base_path, which_set + "_x_words.npy")
         speaker_path = os.path.join(timit_base_path,
                                     which_set + "_spkr.npy")
 
@@ -300,14 +256,10 @@ class TIMITGTFB(Dataset):
             ).tolist().toarray()
             self.speaker_id_list = serial.load(speaker_id_list_path)
             self.speaker_features_list = serial.load(speaker_features_list_path)
-            self.words_list = serial.load(words_list_path)
-            self.phonemes_list = serial.load(phonemes_list_path)
         # Set-related data
         self.raw_wav = serial.load(raw_wav_path)
         if not self.audio_only:
-            self.phonemes = serial.load(phonemes_path)
             self.phones = serial.load(phones_path)
-            self.words = serial.load(words_path)
             self.speaker_id = numpy.asarray(serial.load(speaker_path), 'int')
 
     def _validate_source(self, source):
@@ -425,4 +377,4 @@ if __name__ == "__main__":
     from sys import argv
 
     valid_timit = TIMITGTFB(argv[1], frame_length=240, overlap=120,
-                        frames_per_example=1, audio_only=True)
+                            frames_per_example=1, audio_only=False, n_next_phones=1, n_prev_phones=1)
