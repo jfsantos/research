@@ -31,8 +31,8 @@ class TIMITGTFB(Dataset):
     
     # Mean and standard deviation of the acoustic samples from the whole
     # dataset (train, valid, test).
-    #_mean = 0.0035805809921434142
-    #_std = 542.48824133746177
+    _mean = 2639012.3033423889
+    _std = 23348287.541279223
 
     def __init__(self, which_set, frame_length, overlap=0,
                  n_channels=64, frames_per_example=1, start=0,
@@ -83,8 +83,8 @@ class TIMITGTFB(Dataset):
         # Load data from disk
         self._load_data(which_set, gtfb_data_path)
         # Standardize data
-        # for i, sequence in enumerate(self.raw_wav):
-        #     self.raw_wav[i] = (sequence - TIMIT._mean) / TIMIT._std
+        for i, sequence in enumerate(self.raw_wav):
+            self.raw_wav[i] = (sequence - TIMITGTFB._mean) / TIMITGTFB._std
 
         if filter_fn is not None:
             filter_fn = eval(filter_fn)
@@ -104,6 +104,7 @@ class TIMITGTFB(Dataset):
                 self.phones = self.phones[start:]
 
         examples_per_sequence = [0]
+        self.phone_rel_dur = []
 
         for sequence_id, samples_sequence in enumerate(self.raw_wav):
             if not self.audio_only:
@@ -111,11 +112,17 @@ class TIMITGTFB(Dataset):
                 # Phones segmentation
                 phones_sequence = self.phones[sequence_id]
                 phone_list = numpy.asarray([k for k, g in itertools.groupby(phones_sequence)])
-                phone_position = numpy.cumsum([len(list(g)) for k, g in itertools.groupby(phones_sequence)])
+                phone_duration = [len(list(g)) for k, g in itertools.groupby(phones_sequence)]
+                phone_position = numpy.cumsum(phone_duration)
                 frame_position = numpy.arange(0, tot_n_frames*self.overlap, self.overlap)
                 seq_phones = numpy.empty((tot_n_frames, 1+self.n_prev_phones+self.n_next_phones), dtype=int)
+                phone_rel_dur = numpy.empty(tot_n_frames, dtype=float)
                 for frame in range(tot_n_frames):
                     cur_phone_idx = (frame_position[frame] < phone_position).argmax()
+                    if cur_phone_idx == 0:
+                        phone_rel_dur[frame] = frame_position[frame]/float(phone_duration[cur_phone_idx])
+                    else:
+                        phone_rel_dur[frame] = (frame_position[frame] - phone_position[cur_phone_idx-1])/float(phone_duration[cur_phone_idx])
                     if self.n_prev_phones > 0:
                         if cur_phone_idx - self.n_prev_phones < 0:
                             seq_phones[frame,0:self.n_prev_phones] = 5 # code for silent frame
@@ -127,6 +134,7 @@ class TIMITGTFB(Dataset):
                         else:
                             seq_phones[frame,-self.n_next_phones] = phone_list[cur_phone_idx+1:cur_phone_idx+self.n_next_phones+1] #next phones
                     seq_phones[frame,self.n_prev_phones] = phone_list[cur_phone_idx]
+                self.phone_rel_dur.append(phone_rel_dur)
                 self.phones[sequence_id] = seq_phones
 
             # TODO: look at this, does it force copying the data?
@@ -197,10 +205,18 @@ class TIMITGTFB(Dataset):
                     rval.append(self.phones_sequences[sequence_index][example_index].ravel())
                 return rval
 
-            space_components.extend([phones_space])
-            source_components.extend([phones_source])
-            map_fn_components.extend([phones_map_fn])
-            batch_components.extend([None])
+            phone_rel_dur_space = VectorSpace(dim=1)
+            phone_rel_dur_source = 'phone_rel_dur'
+            def phone_rel_dur_map_fn(indexes):
+                rval = []
+                for sequence_index, example_index in self._fetch_index(indexes):
+                    rval.append(self.phone_rel_dur[sequence_index][example_index])
+                return rval
+
+            space_components.extend([phones_space, phone_rel_dur_space])
+            source_components.extend([phones_source, phone_rel_dur_source])
+            map_fn_components.extend([phones_map_fn, phone_rel_dur_map_fn])
+            batch_components.extend([None, None])
 
         space = CompositeSpace(space_components)
         source = tuple(source_components)
