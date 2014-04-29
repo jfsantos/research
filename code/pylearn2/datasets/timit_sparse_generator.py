@@ -20,11 +20,11 @@ from pylearn2.utils import safe_zip
 from research.code.scripts.segmentaxis import segment_axis
 from research.code.pylearn2.utils.iteration import FiniteDatasetIterator
 from sparse_coding.sparse_coding_gammatone import gammatone_matrix, erb_space
+from sklearn.decomposition import SparseCoder
 import scipy.stats
-import cPickle
 
 
-class TIMITSparse(Dataset):
+class TIMITSparseGenerator(Dataset):
     """
     Frame-based TIMIT dataset
     """
@@ -35,11 +35,11 @@ class TIMITSparse(Dataset):
     _mean = 0.0035805809921434142
     _std = 542.48824133746177
 
-    def __init__(self, which_set, frame_length, overlap=0,
+    def __init__(self, which_set, frame_length, overlap=0.5,
                  frames_per_example=1, start=0, stop=None,
-                 audio_only=False, n_prev_phones=0, n_next_phones=0,
+                 audio_only=True, n_prev_phones=0, n_next_phones=0,
                  samples_to_predict=1, filter_fn=None,
-                 rng=_default_seed, b=1.019, step=8, n_channels=50):
+                 rng=_default_seed, b=1.019, step=64, n_channels=64):
         """
         Parameters
         ----------
@@ -65,7 +65,10 @@ class TIMITSparse(Dataset):
             design matrix when choosing minibatches.
         """
         self.frame_length = frame_length
-        self.overlap = overlap
+        if overlap < 1.0:
+            self.overlap = overlap*frame_length
+        else:
+            self.overlap = overlap
         self.frames_per_example = frames_per_example
         self.offset = self.frame_length - self.overlap
         self.audio_only = audio_only
@@ -76,14 +79,17 @@ class TIMITSparse(Dataset):
         self.step = step
         self.n_channels = n_channels
 
+        print "Frame length %d, overlap %d" % (self.frame_length, self.overlap)
+
         # Initializing the dictionary
         self.D = numpy.r_[tuple(gammatone_matrix(self.b, fc,
                                                  self.frame_length,
                                                  self.step) for fc in
                                 erb_space(150, 8000,
                                           self.n_channels))]
+        print "Using dictionary with shape", self.D.shape
 
-        #self.coder = SparseCoder(dictionary=self.D, transform_n_nonzero_coefs=None, transform_alpha=1, transform_algorithm='omp')
+        self.coder = SparseCoder(dictionary=self.D, transform_n_nonzero_coefs=None, transform_alpha=None, transform_algorithm='omp')
         
         # RNG initialization
         if hasattr(rng, 'random_integers'):
@@ -93,68 +99,16 @@ class TIMITSparse(Dataset):
 
         # Load data from disk
         self._load_data(which_set)
-        # Standardize data
-        for i, sequence in enumerate(self.raw_wav):
-            self.raw_wav[i] = self.scaler.transform(sequence)
-
-        if filter_fn is not None:
-            filter_fn = eval(filter_fn)
-            indexes = filter_fn(self.speaker_info_list[self.speaker_id])
-            self.raw_wav = self.raw_wav[indexes]
-            if not self.audio_only:
-                self.phones = self.phones[indexes]
-                self.phonemes = self.phonemes[indexes]
-                self.words = self.words[indexes]
-
-        # Slice data
-        if stop is not None:
-            self.raw_wav = self.raw_wav[start:stop]
-            if not self.audio_only:
-                self.phones = self.phones[start:stop]
-                self.phonemes = self.phonemes[start:stop]
-                self.words = self.words[start:stop]
-        else:
-            self.raw_wav = self.raw_wav[start:]
-            if not self.audio_only:
-                self.phones = self.phones[start:]
-                self.phonemes = self.phonemes[start:]
-                self.words = self.words[start:]
 
         examples_per_sequence = [0]
 
         for sequence_id, samples_sequence in enumerate(self.raw_wav):
-            if not self.audio_only:
-                # Phones segmentation
-                phones_sequence = self.phones[sequence_id]
-                phones_segmented_sequence = segment_axis(phones_sequence,frame_length,overlap)
-                phones_mode = numpy.concatenate([scipy.stats.mode(phones_segmented_sequence[k-self.n_prev_phones:k+self.n_next_phones+1],axis=1)[0].T for k in range(self.n_prev_phones,len(phones_segmented_sequence)-self.n_next_phones)])
-                self.phones[sequence_id] = numpy.asarray(phones_mode, dtype=numpy.int16)
-                
-                # Phonemes segmentation
-                phonemes_sequence = self.phonemes[sequence_id]
-                phonemes_segmented_sequence = segment_axis(phonemes_sequence,
-                                                           frame_length,
-                                                           overlap)
-                if self.n_next_phones == 0:
-                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:]
-                else:
-                    self.phonemes[sequence_id] = phonemes_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
-                
-                # Words segmentation
-                words_sequence = self.words[sequence_id]
-                words_segmented_sequence = segment_axis(words_sequence,
-                                                        frame_length,
-                                                        overlap)
-                if self.n_next_phones == 0:
-                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:]
-                else:
-                    self.words[sequence_id] = words_segmented_sequence[self.n_prev_phones:-self.n_next_phones]
-
-            if self.n_next_phones == 0:
-                self.raw_wav[sequence_id] = self.raw_wav[sequence_id][self.n_prev_phones:]
-            else:
-                self.raw_wav[sequence_id] = self.raw_wav[sequence_id][self.n_prev_phones:-self.n_next_phones]
-
+            print "Sentence %d/%d" % (sequence_id, len(self.raw_wav))
+            X = segment_axis(samples_sequence,
+                             frame_length,
+                             overlap, end='pad')
+            X = numpy.hanning(self.frame_length) * X
+            self.raw_wav[sequence_id] = scipy.sparse.csr_matrix(self.coder.transform(X))
             # TODO: change me
             # Generate features/targets/phones/phonemes/words map
             num_frames = self.raw_wav[sequence_id].shape[0]
@@ -163,11 +117,7 @@ class TIMITSparse(Dataset):
 
         self.cumulative_example_indexes = numpy.cumsum(examples_per_sequence)
         self.samples_sequences = self.raw_wav
-        #numpy.save('/home/jfsantos/data/%s_sparse_frames.npy' % which_set, self.samples_sequences)
-        if not self.audio_only:
-            self.phones_sequences = self.phones
-            self.phonemes_sequences = self.phonemes
-            self.words_sequences = self.words
+        numpy.save('%s_sparse_frames.npy' % which_set, self.samples_sequences)
         self.num_examples = self.cumulative_example_indexes[-1]
 
         # DataSpecs
@@ -193,51 +143,7 @@ class TIMITSparse(Dataset):
         source_components = [features_source, targets_source]
         map_fn_components = [features_map_fn, targets_map_fn]
         batch_components = [None, None]
-
-        if not self.audio_only:
-            num_phones = numpy.max([numpy.max(sequence) for sequence
-                                    in self.phones]) + 1
-            phones_space = IndexSpace(max_labels=num_phones, dim=1+self.n_prev_phones+self.n_next_phones,
-                                      dtype=str(self.phones_sequences[0].dtype))
-            phones_source = 'phones'
-            def phones_map_fn(indexes):
-                rval = []
-                for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.phones_sequences[sequence_index][example_index].ravel())
-                return rval
-
-            num_phonemes = numpy.max([numpy.max(sequence) for sequence
-                                      in self.phonemes]) + 1
-            phonemes_space = IndexSpace(max_labels=num_phonemes, dim=1,
-                                        dtype=str(self.phonemes_sequences[0].dtype))
-            phonemes_source = 'phonemes'
-            def phonemes_map_fn(indexes):
-                rval = []
-                for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.phonemes_sequences[sequence_index][example_index
-                        + self.frames_per_example].ravel())
-                return rval
-
-            num_words = numpy.max([numpy.max(sequence) for sequence
-                                   in self.words]) + 1
-            words_space = IndexSpace(max_labels=num_words, dim=1,
-                                     dtype=str(self.words_sequences[0].dtype))
-            words_source = 'words'
-            def words_map_fn(indexes):
-                rval = []
-                for sequence_index, example_index in self._fetch_index(indexes):
-                    rval.append(self.words_sequences[sequence_index][example_index
-                        + self.frames_per_example].ravel())
-                return rval
-
-            space_components.extend([phones_space, phonemes_space,
-                                     words_space])
-            source_components.extend([phones_source, phonemes_source,
-                                     words_source])
-            map_fn_components.extend([phones_map_fn, phonemes_map_fn,
-                                     words_map_fn])
-            batch_components.extend([None, None, None])
-
+        
         space = CompositeSpace(space_components)
         source = tuple(source_components)
         self.data_specs = (space, source)
@@ -272,43 +178,12 @@ class TIMITSparse(Dataset):
         # Create file paths
         timit_base_path = os.path.join(os.environ["PYLEARN2_DATA_PATH"],
                                        "timit/readable")
-        speaker_info_list_path = os.path.join(timit_base_path, "spkrinfo.npy")
-        phonemes_list_path = os.path.join(timit_base_path,
-                                          "reduced_phonemes.pkl")
-        words_list_path = os.path.join(timit_base_path, "words.pkl")
-        speaker_features_list_path = os.path.join(timit_base_path,
-                                                  "spkr_feature_names.pkl")
-        speaker_id_list_path = os.path.join(timit_base_path,
-                                            "speakers_ids.pkl")
-        raw_wav_path = os.path.join(timit_base_path, which_set + "_sparse_frames.npy")
-        phonemes_path = os.path.join(timit_base_path,
-                                     which_set + "_x_phonemes.npy")
-        phones_path = os.path.join(timit_base_path,
-                                     which_set + "_x_phones.npy")
-        words_path = os.path.join(timit_base_path, which_set + "_x_words.npy")
-        speaker_path = os.path.join(timit_base_path,
-                                    which_set + "_spkr.npy")
-        scaler_path = os.path.join(timit_base_path, 'scaler.pkl')
-
+        raw_wav_path = os.path.join(timit_base_path, which_set + "_x_raw.npy")
         # Load data. For now most of it is not used, as only the acoustic
         # samples are provided, but this is bound to change eventually.
-        # Global data
-        if not self.audio_only:
-            self.speaker_info_list = serial.load(
-                speaker_info_list_path
-            ).tolist().toarray()
-            self.speaker_id_list = serial.load(speaker_id_list_path)
-            self.speaker_features_list = serial.load(speaker_features_list_path)
-            self.words_list = serial.load(words_list_path)
-            self.phonemes_list = serial.load(phonemes_list_path)
         # Set-related data
         self.raw_wav = serial.load(raw_wav_path)
-        self.scaler = serial.load(scaler_path)
-        if not self.audio_only:
-            self.phonemes = serial.load(phonemes_path)
-            self.phones = serial.load(phones_path)
-            self.words = serial.load(words_path)
-            self.speaker_id = numpy.asarray(serial.load(speaker_path), 'int')
+        #self.scaler = serial.load(scaler_path)
 
     def _validate_source(self, source):
         """
@@ -422,6 +297,6 @@ def dialect_region(spkrinfo, dr):
     return spkrinfo[:,dr] == 1
 
 if __name__ == "__main__":
-    valid_timit = TIMITSparse('valid', 160, audio_only=True)
-    #test_timit = TIMITSparse('test', 160, audio_only=True)
-    #train_timit = TIMITSparse('train', 160, audio_only=True)
+    # Generate datasets
+    from sys import argv
+    dataset = TIMITSparseGenerator(argv[1], 1600, overlap=1400, audio_only=True)
